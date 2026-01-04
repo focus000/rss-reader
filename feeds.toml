@@ -5,6 +5,10 @@ host = "https://rsshub.top/"
 name = "Hacker News"
 url = "https://news.ycombinator.com/rss"
 
+[[rss]]
+name = "Google"
+url = "https://blog.google/rss/"
+
 [[rsshub_feeds]]
 name = "Deepmind"
 url = "/deepmind/blog"

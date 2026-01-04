@@ -524,5 +524,7 @@ fn html_to_lines(html: &str, width: u16) -> Vec<Line<'_>> {
         Ok(text) => text,
         Err(_) => html.to_string(),
     };
-    text.lines().map(|line| Line::from(line.to_string())).collect()
+    text.lines()
+        .map(|line| Line::from(line.to_string()))
+        .collect()
 }

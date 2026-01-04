@@ -1,0 +1,481 @@
+use anyhow::{Context, Result};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::get,
+    Json, Router,
+};
+use rss::Channel;
+use serde::Serialize;
+use std::{net::SocketAddr, sync::Arc};
+use tokio::sync::Mutex;
+use url::Url;
+
+use crate::config::{Config, Feed};
+
+#[derive(Clone)]
+struct AppState {
+    feeds: Vec<Feed>,
+    cache: Arc<Mutex<Vec<Option<FeedResponse>>>>,
+}
+
+#[derive(Serialize, Clone)]
+struct FeedInfo {
+    name: String,
+    url: String,
+    is_rsshub: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct FeedResponse {
+    title: String,
+    description: Option<String>,
+    items: Vec<ItemView>,
+}
+
+#[derive(Serialize, Clone)]
+struct ItemView {
+    title: String,
+    link: Option<String>,
+    pub_date: Option<String>,
+    content_html: Option<String>,
+    description_html: Option<String>,
+}
+
+pub async fn run_server(config: Config, host: String, port: u16, open_browser: bool) -> Result<()> {
+    let feeds = config.get_all_feeds();
+    let cache = vec![None; feeds.len()];
+    let state = AppState {
+        feeds,
+        cache: Arc::new(Mutex::new(cache)),
+    };
+
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/api/feeds", get(list_feeds))
+        .route("/api/feeds/:index", get(get_feed))
+        .with_state(state);
+
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .context("Invalid host/port")?;
+    let url = format!("http://{}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("Server running at {}", url);
+    if open_browser {
+        let _ = open::that(&url);
+    }
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn index() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+async fn list_feeds(State(state): State<AppState>) -> Json<Vec<FeedInfo>> {
+    let feeds = state
+        .feeds
+        .iter()
+        .map(|feed| FeedInfo {
+            name: feed.name.clone(),
+            url: feed.url.clone(),
+            is_rsshub: feed.is_rsshub,
+        })
+        .collect();
+    Json(feeds)
+}
+
+async fn get_feed(Path(index): Path<usize>, State(state): State<AppState>) -> impl IntoResponse {
+    let feed = match state.feeds.get(index) {
+        Some(feed) => feed.clone(),
+        None => return (StatusCode::NOT_FOUND, "Feed not found").into_response(),
+    };
+
+    if let Some(cached) = state.cache.lock().await.get(index).cloned().flatten() {
+        return Json(cached).into_response();
+    }
+
+    let url = match build_feed_url(&feed) {
+        Ok(url) => url,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    match fetch_feed(&url).await {
+        Ok(channel) => {
+            let response = channel_to_response(channel);
+            if let Some(slot) = state.cache.lock().await.get_mut(index) {
+                *slot = Some(response.clone());
+            }
+            Json(response).into_response()
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
+    }
+}
+
+fn build_feed_url(feed: &Feed) -> Result<String> {
+    if feed.is_rsshub {
+        if let Some(host) = &feed.rsshub_host {
+            let base = Url::parse(host)?;
+            let route_clean = if !feed.url.starts_with('/') {
+                format!("/{}", feed.url)
+            } else {
+                feed.url.clone()
+            };
+            Ok(base.join(&route_clean)?.to_string())
+        } else {
+            Ok(feed.url.clone())
+        }
+    } else {
+        Ok(feed.url.clone())
+    }
+}
+
+async fn fetch_feed(url: &str) -> Result<Channel> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("Failed to fetch RSS feed")?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to fetch RSS feed: {}",
+            response.status()
+        ));
+    }
+
+    let content = response
+        .bytes()
+        .await
+        .context("Failed to read response body")?;
+
+    let channel =
+        Channel::read_from(std::io::Cursor::new(content)).context("Failed to parse RSS feed")?;
+    Ok(channel)
+}
+
+fn channel_to_response(channel: Channel) -> FeedResponse {
+    let items = channel
+        .items()
+        .iter()
+        .map(|item| ItemView {
+            title: item.title().unwrap_or("No Title").to_string(),
+            link: item.link().map(|s| s.to_string()),
+            pub_date: item.pub_date().map(|s| s.to_string()),
+            content_html: item.content().map(|s| s.to_string()),
+            description_html: item.description().map(|s| s.to_string()),
+        })
+        .collect();
+
+    FeedResponse {
+        title: channel.title().to_string(),
+        description: if channel.description().is_empty() {
+            None
+        } else {
+            Some(channel.description().to_string())
+        },
+        items,
+    }
+}
+
+const INDEX_HTML: &str = r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RSS Reader</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f6f1e5;
+        --panel: #fff8ef;
+        --accent: #c05621;
+        --accent-soft: #f7d9b5;
+        --ink: #1f1b16;
+        --muted: #7a6756;
+        --border: #e4c9a6;
+        --shadow: 0 10px 25px rgba(60, 30, 0, 0.12);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: "Georgia", "Times New Roman", serif;
+        background: radial-gradient(circle at top, #fff7e9 0%, #f4e3cc 45%, #e9d2b5 100%);
+        color: var(--ink);
+        min-height: 100vh;
+      }
+      header {
+        padding: 24px 32px;
+        border-bottom: 2px solid var(--border);
+        background: rgba(255, 248, 239, 0.8);
+        backdrop-filter: blur(10px);
+      }
+      header h1 {
+        margin: 0;
+        font-size: 28px;
+        letter-spacing: 1px;
+      }
+      header p {
+        margin: 6px 0 0;
+        color: var(--muted);
+      }
+      main {
+        display: grid;
+        grid-template-columns: minmax(260px, 320px) 1fr;
+        gap: 20px;
+        padding: 24px 32px 40px;
+        align-items: stretch;
+      }
+      .sidebar {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+        min-height: 70vh;
+      }
+      .panel,
+      section.content {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        box-shadow: var(--shadow);
+        display: flex;
+        flex-direction: column;
+      }
+      .panel {
+        min-height: 70vh;
+      }
+      section h2 {
+        margin: 0;
+        padding: 16px 18px 12px;
+        font-size: 18px;
+        border-bottom: 1px solid var(--border);
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        color: var(--accent);
+      }
+      .list {
+        list-style: none;
+        margin: 0;
+        padding: 0 10px 14px;
+        overflow-y: auto;
+      }
+      .list li {
+        padding: 12px 10px;
+        margin: 8px 0;
+        border-radius: 12px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        border: 1px solid transparent;
+      }
+      .list li:hover {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+      }
+      .list li.active {
+        background: var(--accent);
+        color: #fffaf3;
+        border-color: var(--accent);
+      }
+      .list li small {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 4px;
+      }
+      .list li.active small {
+        color: #ffe9cf;
+      }
+      .detail {
+        padding: 18px 22px 28px;
+        overflow-y: auto;
+      }
+      .detail h3 {
+        margin: 0 0 6px;
+        font-size: 22px;
+      }
+      .detail .meta {
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 16px;
+      }
+      .detail a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      .detail a:hover {
+        text-decoration: underline;
+      }
+      .detail .content {
+        line-height: 1.6;
+      }
+      .panel-header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding-right: 18px;
+      }
+      .panel-header h2 {
+        border-bottom: 0;
+        padding-left: 0;
+        flex: 1;
+      }
+      .back-button {
+        margin-left: 16px;
+        border: 1px solid var(--border);
+        background: var(--accent-soft);
+        color: var(--ink);
+        border-radius: 999px;
+        padding: 6px 12px;
+        font-size: 12px;
+        cursor: pointer;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+      }
+      .back-button:hover {
+        background: var(--accent);
+        color: #fffaf3;
+      }
+      .hidden {
+        display: none;
+      }
+      .placeholder {
+        padding: 18px 22px;
+        color: var(--muted);
+      }
+      @media (max-width: 1000px) {
+        main {
+          grid-template-columns: 1fr;
+        }
+        section.content {
+          min-height: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>RSS Reader</h1>
+      <p>Sidebar navigation for feeds and items with a focused article view.</p>
+    </header>
+    <main>
+      <aside class="sidebar">
+        <div id="feedsView" class="panel">
+          <h2>Feeds</h2>
+          <ul id="feedList" class="list"></ul>
+        </div>
+        <div id="itemsView" class="panel hidden">
+          <div class="panel-header">
+            <button id="backToFeeds" class="back-button">Back</button>
+            <h2>Items</h2>
+          </div>
+          <ul id="itemList" class="list"></ul>
+        </div>
+      </aside>
+      <section class="content">
+        <h2>Article</h2>
+        <div id="article" class="detail placeholder">Select a feed and item to read.</div>
+      </section>
+    </main>
+    <script>
+      const feedList = document.getElementById("feedList");
+      const itemList = document.getElementById("itemList");
+      const article = document.getElementById("article");
+      const feedsView = document.getElementById("feedsView");
+      const itemsView = document.getElementById("itemsView");
+      const backToFeeds = document.getElementById("backToFeeds");
+      let feeds = [];
+      let currentFeedIndex = null;
+
+      function clearActive(list) {
+        list.querySelectorAll("li").forEach((li) => li.classList.remove("active"));
+      }
+
+      function renderFeeds() {
+        feedList.innerHTML = "";
+        feeds.forEach((feed, index) => {
+          const li = document.createElement("li");
+          li.innerHTML = `${feed.name}<small>${feed.url}</small>`;
+          li.addEventListener("click", () => loadFeed(index, li));
+          feedList.appendChild(li);
+        });
+      }
+
+      function renderItems(items) {
+        itemList.innerHTML = "";
+        if (!items || items.length === 0) {
+          itemList.innerHTML = "<li class='placeholder'>No items.</li>";
+          article.innerHTML = "No items.";
+          return;
+        }
+        items.forEach((item, index) => {
+          const li = document.createElement("li");
+          li.textContent = item.title || "Untitled";
+          li.addEventListener("click", () => showItem(item, li));
+          itemList.appendChild(li);
+        });
+      }
+
+      function showItem(item, li) {
+        clearActive(itemList);
+        li.classList.add("active");
+        const content = item.content_html || item.description_html || "<em>No content.</em>";
+        const link = item.link ? `<a href="${item.link}" target="_blank">Open link</a>` : "";
+        const date = item.pub_date ? item.pub_date : "";
+        article.innerHTML = `
+          <h3>${item.title || "Untitled"}</h3>
+          <div class="meta">${date} ${link}</div>
+          <div class="content">${content}</div>
+        `;
+      }
+
+      async function loadFeed(index, li) {
+        clearActive(feedList);
+        li.classList.add("active");
+        currentFeedIndex = index;
+        article.innerHTML = "Loading...";
+        itemList.innerHTML = "";
+        feedsView.classList.add("hidden");
+        itemsView.classList.remove("hidden");
+        try {
+          const res = await fetch(`/api/feeds/${index}`);
+          if (!res.ok) {
+            throw new Error(await res.text());
+          }
+          const feed = await res.json();
+          renderItems(feed.items);
+          if (feed.items && feed.items.length) {
+            const firstItem = feed.items[0];
+            const firstLi = itemList.querySelector("li");
+            if (firstLi) {
+              showItem(firstItem, firstLi);
+            }
+          }
+        } catch (err) {
+          article.innerHTML = `<span style="color: var(--accent);">Failed to load feed.</span>`;
+        }
+      }
+
+      async function init() {
+        const res = await fetch("/api/feeds");
+        feeds = await res.json();
+        renderFeeds();
+      }
+
+      backToFeeds.addEventListener("click", () => {
+        itemsView.classList.add("hidden");
+        feedsView.classList.remove("hidden");
+        itemList.innerHTML = "";
+        article.innerHTML = "Select a feed and item to read.";
+      });
+
+      init();
+    </script>
+  </body>
+</html>
+"#;

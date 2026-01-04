@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use rss::Channel;
 use std::io::Cursor;
 use std::path::PathBuf;
 use url::Url;
 
 mod config;
+mod server;
 mod tui;
 
 #[derive(Parser)]
@@ -48,6 +49,21 @@ enum Commands {
         /// Path to config file (default: feeds.toml)
         #[arg(short, long, default_value = "feeds.toml")]
         config: PathBuf,
+    },
+    /// Run the web server and open a browser UI
+    Server {
+        /// Path to config file (default: feeds.toml)
+        #[arg(short, long, default_value = "feeds.toml")]
+        config: PathBuf,
+        /// Host to bind (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to bind (default: 7878)
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        /// Disable auto-opening the browser
+        #[arg(long, action = ArgAction::SetFalse, default_value_t = true)]
+        open: bool,
     },
 }
 
@@ -92,6 +108,22 @@ async fn main() -> Result<()> {
             }
             let cfg = config::Config::load(&config)?;
             tui::run_tui(tui::App::with_config(cfg)).await?;
+        }
+        Commands::Server {
+            config,
+            host,
+            port,
+            open,
+        } => {
+            if !config.exists() {
+                println!(
+                    "Config file not found at {:?}. Creating default config.",
+                    config
+                );
+                config::create_default_config(&config)?;
+            }
+            let cfg = config::Config::load(&config)?;
+            server::run_server(cfg, host, port, open).await?;
         }
     }
 

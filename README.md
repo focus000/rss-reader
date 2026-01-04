@@ -25,6 +25,21 @@ cargo run -- ui
 
 Uses `feeds.toml` for feed configuration.
 
+### Browser Server Mode
+
+```bash
+cargo run -- server
+```
+
+Options:
+
+```bash
+cargo run -- server --host 127.0.0.1 --port 7878
+cargo run -- server --open=false
+```
+
+Opens a three-pane browser UI (feeds, items, article) using RSS content HTML.
+
 ### Direct Feed Reading
 
 ```bash
