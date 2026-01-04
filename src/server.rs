@@ -10,9 +10,11 @@ use rss::Channel;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
-use url::Url;
 
-use crate::config::{Config, Feed};
+use crate::{
+    config::{Config, Feed},
+    feed,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -98,64 +100,16 @@ async fn get_feed(Path(index): Path<usize>, State(state): State<AppState>) -> im
         return Json(cached).into_response();
     }
 
-    let url = match build_feed_url(&feed) {
-        Ok(url) => url,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    let response = match feed::fetch_configured_feed(&feed).await {
+        Ok(channel) => channel_to_response(channel),
+        Err(err) => return (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
     };
 
-    match fetch_feed(&url).await {
-        Ok(channel) => {
-            let response = channel_to_response(channel);
-            if let Some(slot) = state.cache.lock().await.get_mut(index) {
-                *slot = Some(response.clone());
-            }
-            Json(response).into_response()
-        }
-        Err(err) => (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
-    }
-}
-
-fn build_feed_url(feed: &Feed) -> Result<String> {
-    if feed.is_rsshub {
-        if let Some(host) = &feed.rsshub_host {
-            let base = Url::parse(host)?;
-            let route_clean = if !feed.url.starts_with('/') {
-                format!("/{}", feed.url)
-            } else {
-                feed.url.clone()
-            };
-            Ok(base.join(&route_clean)?.to_string())
-        } else {
-            Ok(feed.url.clone())
-        }
-    } else {
-        Ok(feed.url.clone())
-    }
-}
-
-async fn fetch_feed(url: &str) -> Result<Channel> {
-    let client = reqwest::Client::new();
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .context("Failed to fetch RSS feed")?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to fetch RSS feed: {}",
-            response.status()
-        ));
+    if let Some(slot) = state.cache.lock().await.get_mut(index) {
+        *slot = Some(response.clone());
     }
 
-    let content = response
-        .bytes()
-        .await
-        .context("Failed to read response body")?;
-
-    let channel =
-        Channel::read_from(std::io::Cursor::new(content)).context("Failed to parse RSS feed")?;
-    Ok(channel)
+    Json(response).into_response()
 }
 
 fn channel_to_response(channel: Channel) -> FeedResponse {

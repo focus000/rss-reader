@@ -1,11 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use rss::Channel;
-use std::io::Cursor;
 use std::path::PathBuf;
-use url::Url;
 
 mod config;
+mod feed;
 mod server;
 mod tui;
 
@@ -74,7 +73,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Read { url, limit, tui } => {
             println!("Fetching RSS from: {}", url);
-            let channel = fetch_feed(&url).await?;
+            let channel = feed::fetch_channel(&url).await?;
             process_channel(channel, limit, tui).await?;
         }
         Commands::Rsshub {
@@ -83,30 +82,13 @@ async fn main() -> Result<()> {
             limit,
             tui,
         } => {
-            let base = Url::parse(&host).context("Invalid host URL")?;
-            let route_clean = if !route.starts_with('/') {
-                format!("/{}", route)
-            } else {
-                route
-            };
-            let url = base.join(&route_clean).context("Invalid route")?;
-            let url_str = url.to_string();
-            println!(
-                "Fetching RSSHub route: {} (full URL: {})",
-                route_clean, url_str
-            );
-            let channel = fetch_feed(&url_str).await?;
+            let url_str = feed::build_rsshub_url(&host, &route)?;
+            println!("Fetching RSSHub route: {} (full URL: {})", route, url_str);
+            let channel = feed::fetch_channel(&url_str).await?;
             process_channel(channel, limit, tui).await?;
         }
         Commands::Ui { config } => {
-            if !config.exists() {
-                println!(
-                    "Config file not found at {:?}. Creating default config.",
-                    config
-                );
-                config::create_default_config(&config)?;
-            }
-            let cfg = config::Config::load(&config)?;
+            let cfg = config::load_or_create_config(&config)?;
             tui::run_tui(tui::App::with_config(cfg)).await?;
         }
         Commands::Server {
@@ -115,45 +97,12 @@ async fn main() -> Result<()> {
             port,
             open,
         } => {
-            if !config.exists() {
-                println!(
-                    "Config file not found at {:?}. Creating default config.",
-                    config
-                );
-                config::create_default_config(&config)?;
-            }
-            let cfg = config::Config::load(&config)?;
+            let cfg = config::load_or_create_config(&config)?;
             server::run_server(cfg, host, port, open).await?;
         }
     }
 
     Ok(())
-}
-
-async fn fetch_feed(url: &str) -> Result<Channel> {
-    let client = reqwest::Client::new();
-
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .context("Failed to fetch RSS feed")?;
-
-    if !response.status().is_success() {
-        println!("Error: Received status code {}", response.status());
-        let text = response.text().await.unwrap_or_default();
-        println!("Response body: {}", text);
-        return Err(anyhow::anyhow!("Failed to fetch RSS feed"));
-    }
-
-    let content = response
-        .bytes()
-        .await
-        .context("Failed to read response body")?;
-
-    let channel = Channel::read_from(Cursor::new(content)).context("Failed to parse RSS feed")?;
-
-    Ok(channel)
 }
 
 async fn process_channel(channel: Channel, limit: usize, use_tui: bool) -> Result<()> {
