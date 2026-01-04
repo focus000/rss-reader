@@ -5,6 +5,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use html2text::from_read;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -12,7 +13,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use rss::{Channel, Item};
+use rss::Channel;
+use rss::Item;
 use std::io::{self, Stdout};
 use url::Url;
 
@@ -490,10 +492,10 @@ fn ui(f: &mut Frame, app: &mut App) {
                 // Show content if available (often fuller than description)
                 if let Some(content) = item.content() {
                     lines.push(Line::from(""));
-                    lines.push(Line::from(content));
+                    lines.extend(html_to_lines(content, main_area.width));
                 } else if let Some(desc) = item.description() {
                     lines.push(Line::from(""));
-                    lines.push(Line::from(desc));
+                    lines.extend(html_to_lines(desc, main_area.width));
                 }
 
                 lines
@@ -514,4 +516,13 @@ fn ui(f: &mut Frame, app: &mut App) {
     let status_paragraph = Paragraph::new(app.status_message.clone())
         .block(Block::default().borders(Borders::ALL).title("Status"));
     f.render_widget(status_paragraph, status_area);
+}
+
+fn html_to_lines(html: &str, width: u16) -> Vec<Line<'_>> {
+    let safe_width = usize::from(width.max(1));
+    let text = match from_read(html.as_bytes(), safe_width) {
+        Ok(text) => text,
+        Err(_) => html.to_string(),
+    };
+    text.lines().map(|line| Line::from(line.to_string())).collect()
 }
