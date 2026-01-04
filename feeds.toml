@@ -1,0 +1,14 @@
+[rsshub]
+host = "https://rsshub.top/"
+
+[[rss]]
+name = "Hacker News"
+url = "https://news.ycombinator.com/rss"
+
+[[rsshub_feeds]]
+name = "Deepmind"
+url = "/deepmind/blog"
+
+[[rsshub_feeds]]
+name = "Anthropic Engineering"
+url = "/anthropic/engineering"
