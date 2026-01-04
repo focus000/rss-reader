@@ -1,4 +1,7 @@
-use crate::config::{Config, Feed};
+use crate::{
+    config::{Config, Feed},
+    feed,
+};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -16,7 +19,6 @@ use ratatui::{
 use rss::Channel;
 use rss::Item;
 use std::io::{self, Stdout};
-use url::Url;
 
 #[derive(PartialEq)]
 pub enum Screen {
@@ -88,59 +90,21 @@ impl App {
         self.is_loading = true;
         self.status_message = format!("Fetching {}...", url_or_route);
 
-        // Note: In a real async TUI, we'd spawn a task and send a message back.
-        // For simplicity here, we're doing a blocking wait which freezes the UI.
-
-        let url_res: Result<String> = if is_rsshub {
-            if let Some(host) = rsshub_host {
-                let base = Url::parse(&host)?;
-                let route_clean = if !url_or_route.starts_with('/') {
-                    format!("/{}", url_or_route)
-                } else {
-                    url_or_route
-                };
-                let url = base.join(&route_clean)?;
-                Ok(url.to_string())
-            } else {
-                Ok(url_or_route)
-            }
+        let url_result = if is_rsshub {
+            let host = rsshub_host
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("RSSHub host missing for feed"))?;
+            feed::build_rsshub_url(host, &url_or_route)
         } else {
             Ok(url_or_route)
         };
 
-        let url = match url_res {
-            Ok(url) => url,
-            Err(e) => {
-                self.is_loading = false;
-                self.status_message = format!("Error: {}", e);
-                return Err(e);
-            }
+        let channel_result = match url_result {
+            Ok(url) => feed::fetch_channel(&url).await,
+            Err(err) => Err(err),
         };
 
-        let client = reqwest::Client::new();
-        let response_res = client.get(&url).send().await;
-
-        let channel_res = match response_res {
-            Ok(response) => {
-                if !response.status().is_success() {
-                    Err(anyhow::anyhow!(
-                        "Failed to fetch feed: {}",
-                        response.status()
-                    ))
-                } else {
-                    match response.bytes().await {
-                        Ok(content) => match Channel::read_from(std::io::Cursor::new(content)) {
-                            Ok(channel) => Ok(channel),
-                            Err(e) => Err(anyhow::anyhow!(e)),
-                        },
-                        Err(e) => Err(anyhow::anyhow!(e)),
-                    }
-                }
-            }
-            Err(e) => Err(anyhow::anyhow!(e)),
-        };
-
-        match channel_res {
+        match channel_result {
             Ok(channel) => {
                 self.current_items = channel.items().to_vec();
                 self.current_feed = Some(channel);

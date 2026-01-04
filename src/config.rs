@@ -80,6 +80,17 @@ impl Config {
     }
 }
 
+pub fn load_or_create_config(path: &Path) -> Result<Config> {
+    if !path.exists() {
+        println!(
+            "Config file not found at {:?}. Creating default config.",
+            path
+        );
+        create_default_config(path)?;
+    }
+    Config::load(path)
+}
+
 pub fn create_default_config(path: &Path) -> Result<()> {
     let config = Config {
         rsshub: RssHubConfig {
