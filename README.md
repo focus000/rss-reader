@@ -38,7 +38,14 @@ cargo run -- server --host 127.0.0.1 --port 7878
 cargo run -- server --open=false
 ```
 
-Opens a three-pane browser UI (feeds, items, article) using RSS content HTML.
+Opens a sidebar browser UI (feeds -> items) with a focused article view. Articles are stored
+as Markdown and rendered on demand.
+
+### Storage
+
+- Article markdown files: `data/articles/*.md`
+- Image assets: `data/articles/images/`
+- Index CSV: `data/articles/index.csv` with columns `time,article_name,rss_subscription_name,path`
 
 ### Direct Feed Reading
 
