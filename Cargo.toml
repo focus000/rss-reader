@@ -16,6 +16,8 @@ ratatui = "0.30.0"
 reqwest = { version = "0.13.0", features = ["json"] }
 rss = "2.0.12"
 serde = { version = "1.0.228", features = ["derive"] }
+chrono = { version = "0.4.38", features = ["serde"] }
+sqlx = { version = "0.7.4", features = ["sqlite", "runtime-tokio-rustls", "chrono"] }
 tokio = { version = "1.48.0", features = ["full"] }
 toml = "0.9.10"
 url = "2.5.7"
