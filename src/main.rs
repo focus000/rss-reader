@@ -4,6 +4,7 @@ use rss::Channel;
 use std::path::PathBuf;
 
 mod config;
+mod db;
 mod feed;
 mod server;
 mod tui;
@@ -69,12 +70,18 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let database = db::Database::initialize(&db::default_db_path()).await?;
 
     match cli.command {
         Commands::Read { url, limit, tui } => {
             println!("Fetching RSS from: {}", url);
             let channel = feed::fetch_channel(&url).await?;
-            process_channel(channel, limit, tui).await?;
+            let feed_name = if channel.title().is_empty() {
+                url.clone()
+            } else {
+                channel.title().to_string()
+            };
+            process_channel(channel, limit, tui, Some(&database), &feed_name, &url).await?;
         }
         Commands::Rsshub {
             route,
@@ -85,7 +92,12 @@ async fn main() -> Result<()> {
             let url_str = feed::build_rsshub_url(&host, &route)?;
             println!("Fetching RSSHub route: {} (full URL: {})", route, url_str);
             let channel = feed::fetch_channel(&url_str).await?;
-            process_channel(channel, limit, tui).await?;
+            let feed_name = if channel.title().is_empty() {
+                route.clone()
+            } else {
+                channel.title().to_string()
+            };
+            process_channel(channel, limit, tui, Some(&database), &feed_name, &url_str).await?;
         }
         Commands::Ui { config } => {
             let cfg = config::load_or_create_config(&config)?;
@@ -98,14 +110,27 @@ async fn main() -> Result<()> {
             open,
         } => {
             let cfg = config::load_or_create_config(&config)?;
-            server::run_server(cfg, host, port, open).await?;
+            server::run_server(cfg, host, port, open, database.clone()).await?;
         }
     }
 
     Ok(())
 }
 
-async fn process_channel(channel: Channel, limit: usize, use_tui: bool) -> Result<()> {
+async fn process_channel(
+    channel: Channel,
+    limit: usize,
+    use_tui: bool,
+    db: Option<&db::Database>,
+    feed_name: &str,
+    feed_url: &str,
+) -> Result<()> {
+    if let Some(database) = db {
+        database
+            .store_channel(feed_name, feed_url, &channel)
+            .await?;
+    }
+
     if use_tui {
         tui::run_tui(tui::App::with_channel(channel)).await?;
     } else {

@@ -13,13 +13,14 @@ use tokio::sync::Mutex;
 
 use crate::{
     config::{Config, Feed},
-    feed,
+    db, feed,
 };
 
 #[derive(Clone)]
 struct AppState {
     feeds: Vec<Feed>,
     cache: Arc<Mutex<Vec<Option<FeedResponse>>>>,
+    db: db::Database,
 }
 
 #[derive(Serialize, Clone)]
@@ -45,12 +46,19 @@ struct ItemView {
     description_html: Option<String>,
 }
 
-pub async fn run_server(config: Config, host: String, port: u16, open_browser: bool) -> Result<()> {
+pub async fn run_server(
+    config: Config,
+    host: String,
+    port: u16,
+    open_browser: bool,
+    database: db::Database,
+) -> Result<()> {
     let feeds = config.get_all_feeds();
     let cache = vec![None; feeds.len()];
     let state = AppState {
         feeds,
         cache: Arc::new(Mutex::new(cache)),
+        db: database,
     };
 
     let app = Router::new()
@@ -100,10 +108,20 @@ async fn get_feed(Path(index): Path<usize>, State(state): State<AppState>) -> im
         return Json(cached).into_response();
     }
 
-    let response = match feed::fetch_configured_feed(&feed).await {
-        Ok(channel) => channel_to_response(channel),
+    let channel = match feed::fetch_configured_feed(&feed).await {
+        Ok(channel) => channel,
         Err(err) => return (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
     };
+
+    if let Err(err) = state
+        .db
+        .store_channel(&feed.name, &feed.url, &channel)
+        .await
+    {
+        eprintln!("Failed to persist feed items: {}", err);
+    }
+
+    let response = channel_to_response(channel);
 
     if let Some(slot) = state.cache.lock().await.get_mut(index) {
         *slot = Some(response.clone());
