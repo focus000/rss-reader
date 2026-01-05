@@ -10,6 +10,7 @@ use rss::Channel;
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::Mutex;
+use tower_http::services::ServeDir;
 
 use crate::{
     config::{Config, Feed},
@@ -19,7 +20,7 @@ use crate::{
 #[derive(Clone)]
 struct AppState {
     feeds: Vec<Feed>,
-    cache: Arc<Mutex<Vec<Option<FeedResponse>>>>,
+    cache: Arc<Mutex<Vec<Option<Channel>>>>,
     db: db::Database,
 }
 
@@ -34,16 +35,23 @@ struct FeedInfo {
 struct FeedResponse {
     title: String,
     description: Option<String>,
-    items: Vec<ItemView>,
+    items: Vec<ItemMeta>,
 }
 
 #[derive(Serialize, Clone)]
-struct ItemView {
+struct ItemMeta {
+    id: usize,
     title: String,
     link: Option<String>,
     pub_date: Option<String>,
-    content_html: Option<String>,
-    description_html: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ItemContent {
+    title: String,
+    link: Option<String>,
+    pub_date: Option<String>,
+    content_html: String,
 }
 
 pub async fn run_server(
@@ -65,6 +73,11 @@ pub async fn run_server(
         .route("/", get(index))
         .route("/api/feeds", get(list_feeds))
         .route("/api/feeds/:index", get(get_feed))
+        .route("/api/feeds/:index/items/:item_index", get(get_item))
+        .nest_service(
+            "/images",
+            ServeDir::new(db::default_store_dir().join("images")),
+        )
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", host, port)
@@ -104,42 +117,102 @@ async fn get_feed(Path(index): Path<usize>, State(state): State<AppState>) -> im
         None => return (StatusCode::NOT_FOUND, "Feed not found").into_response(),
     };
 
-    if let Some(cached) = state.cache.lock().await.get(index).cloned().flatten() {
-        return Json(cached).into_response();
-    }
-
-    let channel = match feed::fetch_configured_feed(&feed).await {
+    let channel = match get_or_fetch_channel(index, &feed, &state).await {
         Ok(channel) => channel,
-        Err(err) => return (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
+        Err(response) => return response,
     };
 
-    if let Err(err) = state
-        .db
-        .store_channel(&feed.name, &feed.url, &channel)
-        .await
-    {
-        eprintln!("Failed to persist feed items: {}", err);
-    }
+    let db = state.db.clone();
+    let feed_name = feed.name.clone();
+    let feed_url = feed.url.clone();
+    let channel_clone = channel.clone();
+    tokio::spawn(async move {
+        let _ = db
+            .store_channel(&feed_name, &feed_url, &channel_clone)
+            .await;
+    });
 
-    let response = channel_to_response(channel);
-
-    if let Some(slot) = state.cache.lock().await.get_mut(index) {
-        *slot = Some(response.clone());
-    }
-
-    Json(response).into_response()
+    Json(channel_to_response(&channel)).into_response()
 }
 
-fn channel_to_response(channel: Channel) -> FeedResponse {
+async fn get_item(
+    Path((index, item_index)): Path<(usize, usize)>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let feed = match state.feeds.get(index) {
+        Some(feed) => feed.clone(),
+        None => return (StatusCode::NOT_FOUND, "Feed not found").into_response(),
+    };
+
+    let channel = match get_or_fetch_channel(index, &feed, &state).await {
+        Ok(channel) => channel,
+        Err(response) => return response,
+    };
+
+    let item = match channel.items().get(item_index) {
+        Some(item) => item,
+        None => return (StatusCode::NOT_FOUND, "Item not found").into_response(),
+    };
+
+    let markdown = match state.db.read_item_markdown(&feed.name, &feed.url, item) {
+        Some(markdown) => markdown,
+        None => {
+            return Json(ItemContent {
+                title: item.title().unwrap_or("No Title").to_string(),
+                link: item.link().map(|s| s.to_string()),
+                pub_date: item.pub_date().map(|s| s.to_string()),
+                content_html: "<em>Content is still processing.</em>".to_string(),
+            })
+            .into_response();
+        }
+    };
+
+    let content_html = if markdown.trim().is_empty() {
+        "<em>No content.</em>".to_string()
+    } else {
+        db::render_markdown_html(&markdown)
+    };
+
+    Json(ItemContent {
+        title: item.title().unwrap_or("No Title").to_string(),
+        link: item.link().map(|s| s.to_string()),
+        pub_date: item.pub_date().map(|s| s.to_string()),
+        content_html,
+    })
+    .into_response()
+}
+
+async fn get_or_fetch_channel(
+    index: usize,
+    feed: &Feed,
+    state: &AppState,
+) -> Result<Channel, axum::response::Response> {
+    if let Some(cached) = state.cache.lock().await.get(index).cloned().flatten() {
+        return Ok(cached);
+    }
+
+    let channel = match feed::fetch_configured_feed(feed).await {
+        Ok(channel) => channel,
+        Err(err) => return Err((StatusCode::BAD_GATEWAY, err.to_string()).into_response()),
+    };
+
+    if let Some(slot) = state.cache.lock().await.get_mut(index) {
+        *slot = Some(channel.clone());
+    }
+
+    Ok(channel)
+}
+
+fn channel_to_response(channel: &Channel) -> FeedResponse {
     let items = channel
         .items()
         .iter()
-        .map(|item| ItemView {
+        .enumerate()
+        .map(|(idx, item)| ItemMeta {
+            id: idx,
             title: item.title().unwrap_or("No Title").to_string(),
             link: item.link().map(|s| s.to_string()),
             pub_date: item.pub_date().map(|s| s.to_string()),
-            content_html: item.content().map(|s| s.to_string()),
-            description_html: item.description().map(|s| s.to_string()),
         })
         .collect();
 
@@ -286,6 +359,15 @@ const INDEX_HTML: &str = r#"<!doctype html>
       .detail .content {
         line-height: 1.6;
       }
+      .detail .content p {
+        margin: 0 0 12px;
+      }
+      .detail .content code {
+        background: var(--accent-soft);
+        padding: 2px 4px;
+        border-radius: 4px;
+        font-size: 0.9em;
+      }
       .panel-header {
         display: flex;
         align-items: center;
@@ -388,22 +470,33 @@ const INDEX_HTML: &str = r#"<!doctype html>
         items.forEach((item, index) => {
           const li = document.createElement("li");
           li.textContent = item.title || "Untitled";
-          li.addEventListener("click", () => showItem(item, li));
+          li.addEventListener("click", () => loadItem(item, li));
           itemList.appendChild(li);
         });
       }
 
-      function showItem(item, li) {
+      async function loadItem(item, li) {
         clearActive(itemList);
         li.classList.add("active");
-        const content = item.content_html || item.description_html || "<em>No content.</em>";
-        const link = item.link ? `<a href="${item.link}" target="_blank">Open link</a>` : "";
-        const date = item.pub_date ? item.pub_date : "";
-        article.innerHTML = `
-          <h3>${item.title || "Untitled"}</h3>
-          <div class="meta">${date} ${link}</div>
-          <div class="content">${content}</div>
-        `;
+        article.innerHTML = "Loading article...";
+        try {
+          const res = await fetch(`/api/feeds/${currentFeedIndex}/items/${item.id}`);
+          if (!res.ok) {
+            throw new Error(await res.text());
+          }
+          const content = await res.json();
+          const link = content.link
+            ? `<a href="${content.link}" target="_blank">Open link</a>`
+            : "";
+          const date = content.pub_date ? content.pub_date : "";
+          article.innerHTML = `
+            <h3>${content.title || "Untitled"}</h3>
+            <div class="meta">${date} ${link}</div>
+            <div class="content">${content.content_html}</div>
+          `;
+        } catch (err) {
+          article.innerHTML = `<span style="color: var(--accent);">Failed to load article.</span>`;
+        }
       }
 
       async function loadFeed(index, li) {
@@ -425,7 +518,7 @@ const INDEX_HTML: &str = r#"<!doctype html>
             const firstItem = feed.items[0];
             const firstLi = itemList.querySelector("li");
             if (firstLi) {
-              showItem(firstItem, firstLi);
+              loadItem(firstItem, firstLi);
             }
           }
         } catch (err) {

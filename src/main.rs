@@ -70,7 +70,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let database = db::Database::initialize(&db::default_db_path()).await?;
+    let database = db::Database::initialize(&db::default_store_dir()).await?;
 
     match cli.command {
         Commands::Read { url, limit, tui } => {
@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
         }
         Commands::Ui { config } => {
             let cfg = config::load_or_create_config(&config)?;
-            tui::run_tui(tui::App::with_config(cfg)).await?;
+            tui::run_tui(tui::App::with_config_and_db(cfg, Some(database.clone()))).await?;
         }
         Commands::Server {
             config,
@@ -125,15 +125,20 @@ async fn process_channel(
     feed_name: &str,
     feed_url: &str,
 ) -> Result<()> {
-    if let Some(database) = db {
-        database
-            .store_channel(feed_name, feed_url, &channel)
-            .await?;
-    }
-
     if use_tui {
-        tui::run_tui(tui::App::with_channel(channel)).await?;
+        let app = tui::App::with_channel_and_db(
+            channel,
+            db.cloned(),
+            Some(feed_name.to_string()),
+            Some(feed_url.to_string()),
+        );
+        tui::run_tui(app).await?;
     } else {
+        if let Some(database) = db {
+            database
+                .store_channel(feed_name, feed_url, &channel)
+                .await?;
+        }
         print_channel(&channel, limit);
     }
     Ok(())

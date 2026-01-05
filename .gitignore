@@ -19,6 +19,9 @@ Cargo.lock
 logs/
 *.log
 
+# Stored content
+data/
+
 # Environment
 .env
 .env.local

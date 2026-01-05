@@ -1,6 +1,6 @@
 use crate::{
     config::{Config, Feed},
-    feed,
+    db, feed,
 };
 use anyhow::Result;
 use crossterm::{
@@ -8,7 +8,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use html2text::from_read;
+use minimad::{parse_text, Composite, CompositeStyle, Line as MdLine, Options};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -31,6 +31,10 @@ pub struct App {
     pub config: Option<Config>,
     pub feeds: Vec<Feed>,
     pub current_feed: Option<Channel>,
+    pub current_feed_name: Option<String>,
+    pub current_feed_url: Option<String>,
+    pub item_markdown: Vec<Option<String>>,
+    pub db: Option<db::Database>,
     pub current_items: Vec<Item>,
     pub current_screen: Screen,
     pub feed_state: ListState,
@@ -47,6 +51,10 @@ impl App {
             config: None,
             feeds: Vec::new(),
             current_feed: None,
+            current_feed_name: None,
+            current_feed_url: None,
+            item_markdown: Vec::new(),
+            db: None,
             current_items: Vec::new(),
             current_screen: Screen::Feeds,
             feed_state: ListState::default(),
@@ -58,22 +66,31 @@ impl App {
         }
     }
 
-    pub fn with_config(config: Config) -> Self {
+    pub fn with_config_and_db(config: Config, db: Option<db::Database>) -> Self {
         let mut app = Self::new();
         app.feeds = config.get_all_feeds();
         app.config = Some(config);
+        app.db = db;
         if !app.feeds.is_empty() {
             app.feed_state.select(Some(0));
         }
         app
     }
 
-    // Helper for direct URL/RSSHub usage (backward compatibility)
-    pub fn with_channel(channel: Channel) -> Self {
+    pub fn with_channel_and_db(
+        channel: Channel,
+        db: Option<db::Database>,
+        feed_name: Option<String>,
+        feed_url: Option<String>,
+    ) -> Self {
         let items = channel.items().to_vec();
         let mut app = Self::new();
         app.current_feed = Some(channel);
         app.current_items = items;
+        app.item_markdown = vec![None; app.current_items.len()];
+        app.db = db;
+        app.current_feed_name = feed_name;
+        app.current_feed_url = feed_url;
         app.current_screen = Screen::Items;
         if !app.current_items.is_empty() {
             app.item_state.select(Some(0));
@@ -86,10 +103,12 @@ impl App {
         url_or_route: String,
         is_rsshub: bool,
         rsshub_host: Option<String>,
+        feed_name: Option<String>,
     ) -> Result<()> {
         self.is_loading = true;
         self.status_message = format!("Fetching {}...", url_or_route);
 
+        let url_source = url_or_route.clone();
         let url_result = if is_rsshub {
             let host = rsshub_host
                 .as_deref()
@@ -108,11 +127,25 @@ impl App {
             Ok(channel) => {
                 self.current_items = channel.items().to_vec();
                 self.current_feed = Some(channel);
+                self.current_feed_name = feed_name;
+                self.current_feed_url = Some(url_source);
+                self.item_markdown = vec![None; self.current_items.len()];
                 self.is_loading = false;
                 self.status_message =
                     String::from("Loaded feed. Press 'Enter' to view article, 'Esc' to back.");
                 self.current_screen = Screen::Items;
                 self.item_state.select(Some(0));
+
+                if let (Some(db), Some(feed_name), Some(feed_url), Some(channel)) = (
+                    self.db.clone(),
+                    self.current_feed_name.clone(),
+                    self.current_feed_url.clone(),
+                    self.current_feed.clone(),
+                ) {
+                    tokio::spawn(async move {
+                        let _ = db.store_channel(&feed_name, &feed_url, &channel).await;
+                    });
+                }
                 Ok(())
             }
             Err(e) => {
@@ -210,8 +243,12 @@ impl App {
                     if let Some(feed) = self.feeds.get(i) {
                         let is_rsshub = feed.is_rsshub;
                         let host = feed.rsshub_host.clone();
+                        let feed_name = Some(feed.name.clone());
 
-                        if let Err(e) = self.fetch_feed(feed.url.clone(), is_rsshub, host).await {
+                        if let Err(e) = self
+                            .fetch_feed(feed.url.clone(), is_rsshub, host, feed_name)
+                            .await
+                        {
                             // Status message is set in fetch_feed on error for more specific details
                             if self.status_message.starts_with("Fetching") {
                                 self.status_message = format!("Error: {}", e);
@@ -223,6 +260,11 @@ impl App {
             }
             Screen::Items => {
                 if self.item_state.selected().is_some() {
+                    self.status_message = String::from("Loading article...");
+                    if let Err(e) = self.load_markdown_for_selected().await {
+                        self.status_message = format!("Error: {}", e);
+                        return;
+                    }
                     self.current_screen = Screen::Article;
                     self.scroll_offset = 0;
                     self.status_message =
@@ -247,7 +289,10 @@ impl App {
                 if self.config.is_some() {
                     self.current_screen = Screen::Feeds;
                     self.current_feed = None;
+                    self.current_feed_name = None;
+                    self.current_feed_url = None;
                     self.current_items.clear();
+                    self.item_markdown.clear();
                     self.status_message = String::from("Select a feed. Press 'Enter' to open.");
                 } else {
                     // Direct mode, just quit? or do nothing?
@@ -268,9 +313,53 @@ impl App {
     pub fn scroll_up(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_sub(1);
     }
+
+    async fn load_markdown_for_selected(&mut self) -> Result<()> {
+        let Some(index) = self.item_state.selected() else {
+            return Ok(());
+        };
+        if self
+            .item_markdown
+            .get(index)
+            .map(|value| value.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let item = match self.current_items.get(index) {
+            Some(item) => item,
+            None => return Ok(()),
+        };
+        let feed_name = self.current_feed_name.as_deref().unwrap_or("Unknown Feed");
+        let feed_url = self.current_feed_url.as_deref().unwrap_or("unknown");
+
+        let markdown = if let Some(db) = &self.db {
+            db.read_item_markdown(feed_name, feed_url, item)
+        } else {
+            Some(db::extract_markdown(item))
+        };
+
+        if let Some(slot) = self.item_markdown.get_mut(index) {
+            *slot = markdown;
+        }
+
+        Ok(())
+    }
 }
 
 pub async fn run_tui(mut app: App) -> Result<()> {
+    if let (Some(db), Some(feed_name), Some(feed_url), Some(channel)) = (
+        app.db.clone(),
+        app.current_feed_name.clone(),
+        app.current_feed_url.clone(),
+        app.current_feed.clone(),
+    ) {
+        tokio::spawn(async move {
+            let _ = db.store_channel(&feed_name, &feed_url, &channel).await;
+        });
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if let Err(err) = execute!(stdout, EnterAlternateScreen) {
@@ -453,13 +542,22 @@ fn ui(f: &mut Frame, app: &mut App) {
 
                 lines.push(Line::from(""));
 
-                // Show content if available (often fuller than description)
-                if let Some(content) = item.content() {
-                    lines.push(Line::from(""));
-                    lines.extend(html_to_lines(content, main_area.width));
-                } else if let Some(desc) = item.description() {
-                    lines.push(Line::from(""));
-                    lines.extend(html_to_lines(desc, main_area.width));
+                let markdown = app
+                    .item_markdown
+                    .get(app.item_state.selected().unwrap_or(0))
+                    .and_then(|value| value.as_ref());
+                match markdown {
+                    Some(markdown) => {
+                        if !markdown.trim().is_empty() {
+                            lines.push(Line::from(""));
+                            lines.extend(markdown_to_lines(markdown, main_area.width));
+                        } else {
+                            lines.push(Line::from("No content."));
+                        }
+                    }
+                    None => {
+                        lines.push(Line::from("Content is still processing..."));
+                    }
                 }
 
                 lines
@@ -482,13 +580,90 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.render_widget(status_paragraph, status_area);
 }
 
-fn html_to_lines(html: &str, width: u16) -> Vec<Line<'_>> {
-    let safe_width = usize::from(width.max(1));
-    let text = match from_read(html.as_bytes(), safe_width) {
-        Ok(text) => text,
-        Err(_) => html.to_string(),
-    };
-    text.lines()
-        .map(|line| Line::from(line.to_string()))
-        .collect()
+fn markdown_to_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
+    let text = parse_text(markdown, Options::default());
+    let max_width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+
+    for line in text.lines {
+        match line {
+            MdLine::Normal(composite) => lines.push(composite_to_line(composite)),
+            MdLine::CodeFence(composite) => lines.push(composite_to_line(composite)),
+            MdLine::TableRow(row) => {
+                let row_text = row
+                    .cells
+                    .iter()
+                    .map(|cell| composite_plain(cell))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                lines.push(Line::from(row_text));
+            }
+            MdLine::TableRule(_) | MdLine::HorizontalRule => {
+                lines.push(Line::from("─".repeat(max_width)));
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from("No content."));
+    }
+
+    lines
+}
+
+fn composite_to_line(composite: Composite<'_>) -> Line<'static> {
+    let mut spans = Vec::new();
+    if let Some(prefix) = composite_prefix(&composite.style) {
+        spans.push(Span::styled(
+            prefix.to_string(),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    for compound in composite.compounds {
+        let mut style = Style::default();
+        if compound.bold || matches!(composite.style, CompositeStyle::Header(_)) {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if compound.italic {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        if compound.strikeout {
+            style = style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if compound.code {
+            style = style.fg(Color::Yellow);
+        }
+        if matches!(composite.style, CompositeStyle::Quote) {
+            style = style.fg(Color::Gray);
+        }
+        spans.push(Span::styled(compound.src.to_string(), style));
+    }
+
+    Line::from(spans)
+}
+
+fn composite_prefix(style: &CompositeStyle) -> Option<String> {
+    match style {
+        CompositeStyle::ListItem(depth) => {
+            let indent = "  ".repeat(*depth as usize);
+            Some(format!("{indent}• "))
+        }
+        CompositeStyle::Quote => Some("│ ".to_string()),
+        CompositeStyle::Code => Some("    ".to_string()),
+        CompositeStyle::Header(level) => {
+            let prefix = "#".repeat(*level as usize);
+            Some(format!("{prefix} "))
+        }
+        CompositeStyle::Paragraph => None,
+    }
+}
+
+fn composite_plain(composite: &Composite<'_>) -> String {
+    composite
+        .compounds
+        .iter()
+        .map(|compound| compound.src)
+        .collect::<Vec<_>>()
+        .join("")
 }
