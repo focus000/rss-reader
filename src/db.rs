@@ -1,7 +1,7 @@
 use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Utc};
 use html2text::from_read;
 use rss::Channel;
 use sqlx::{
@@ -130,7 +130,10 @@ fn extract_markdown(item: &rss::Item) -> String {
 }
 
 fn html_to_markdown(html: &str) -> String {
-    from_read(html.as_bytes(), 80).unwrap_or_else(|_| html.to_string())
+    match from_read(html.as_bytes(), 80) {
+        Ok(markdown) => markdown,
+        Err(_) => html.to_string(),
+    }
 }
 
 fn parse_pub_date(input: Option<&str>) -> Option<String> {
